@@ -66,6 +66,40 @@ let lastNoticeAt = 0;
 const NOTICE_DEDUPE_WINDOW_MS = 250;
 
 /**
+ * 同一会话在短时间内连续到达的消息（模型分条回复、追发）不再逐条响铃：
+ * 等最后一条到达后再统一发一条，正文带上「N 条新消息」。
+ * 只影响壳内系统通知；不同会话各自计时，互不覆盖。
+ */
+const NOTICE_MERGE_WINDOW_MS = 1200;
+type PendingNotice = {
+    title: string;
+    body: string;
+    avatar: string;
+    sessionId: string;
+    count: number;
+    timer: number | null;
+    lastBody: string;
+    lastBodyAt: number;
+};
+const pendingNotices = new Map<string, PendingNotice>();
+
+function flushShellNotification(key: string): void {
+    const pending = pendingNotices.get(key);
+    if (!pending) return;
+    pendingNotices.delete(key);
+    const bridge = getBridge();
+    if (!bridge) return;
+    const body = pending.count > 1
+        ? `${pending.count} 条新消息 · ${pending.body}`
+        : pending.body;
+    try {
+        bridge.notify?.(pending.title || "小手机", body, pending.avatar, pending.sessionId);
+    } catch {
+        // 桥调用异常（旧壳签名不匹配等）绝不能让业务逻辑崩掉
+    }
+}
+
+/**
  * 发一条壳原生系统通知。非壳环境或旧版壳这是空操作（返回 false），
  * 调用方不需要自己也做环境判断。
  */
@@ -77,15 +111,40 @@ export function sendShellNotification(
 ): boolean {
     const bridge = getBridge();
     if (!bridge) return false;
-    const noticeKey = `${title}\u0000${body}`;
+    const sid = sessionId?.trim() || "";
+    const key = sid || `title:${title}`;
+    const text = body || "";
     const now = Date.now();
+
+    const pending = pendingNotices.get(key);
+    if (pending) {
+        // 同一条消息被两条链路重复请求：正文相同且在去重窗口内，不计入条数
+        if (pending.lastBody === text && now - pending.lastBodyAt < NOTICE_DEDUPE_WINDOW_MS) return true;
+        pending.count += 1;
+        pending.title = title || pending.title;
+        pending.body = text || pending.body;
+        pending.avatar = normalizeAvatar(avatar) || pending.avatar;
+        pending.lastBody = text;
+        pending.lastBodyAt = now;
+        if (pending.timer !== null) window.clearTimeout(pending.timer);
+        pending.timer = window.setTimeout(() => flushShellNotification(key), NOTICE_MERGE_WINDOW_MS);
+        return true;
+    }
+
+    const noticeKey = `${title}\u0000${text}`;
     if (noticeKey === lastNoticeKey && now - lastNoticeAt < NOTICE_DEDUPE_WINDOW_MS) return true;
     lastNoticeKey = noticeKey;
     lastNoticeAt = now;
-    try {
-        return bridge.notify?.(title || "小手机", body || "", normalizeAvatar(avatar), sessionId || "") === true;
-    } catch {
-        // 桥调用异常（旧壳签名不匹配等）绝不能让业务逻辑崩掉
-        return false;
-    }
+
+    pendingNotices.set(key, {
+        title: title || "小手机",
+        body: text,
+        avatar: normalizeAvatar(avatar),
+        sessionId: sid,
+        count: 1,
+        timer: window.setTimeout(() => flushShellNotification(key), NOTICE_MERGE_WINDOW_MS),
+        lastBody: text,
+        lastBodyAt: now,
+    });
+    return true;
 }
